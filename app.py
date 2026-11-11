@@ -14,8 +14,698 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-import cng_data as D
-import cng_sim as S
+import types
+
+# ==========================================================================
+# DATA LOADING AND CLEANING (formerly cng_data.py)
+# ==========================================================================
+
+import contextlib
+import io
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Data helpers (copied from the project's src/ package so this file is standalone)
+# ---------------------------------------------------------------------------
+import math
+from datetime import datetime, time
+from typing import Any
+
+HERE = Path(__file__).resolve().parent
+CAPACITIES = {"CNG bus": 13, "Keke": 5}
+SHEET_CONFIG = {
+    "queue": {"csv": "B1_Queue_and_Demand.csv", "event_time": "Time"},
+    "wait": {"csv": "B2_Wait_Sample.csv", "event_time": "Time joined"},
+    "vehicle": {"csv": "C_Vehicle_and_Trip.csv", "event_time": "Arrived"},
+}
+
+
+def read_csv_sheet(name: str) -> pd.DataFrame:
+    path = HERE / name
+    try:
+        frame = pd.read_csv(path, header=3, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        frame = pd.read_csv(path, header=3, encoding="cp1252")
+    frame.columns = [str(c).strip() for c in frame.columns]
+    return frame.dropna(how="all").reset_index(drop=True)
+
+
+def load_all_data() -> dict[str, pd.DataFrame]:
+    return {
+        key: normalize_frame(key, read_csv_sheet(cfg["csv"]))
+        for key, cfg in SHEET_CONFIG.items()
+    }
+
+
+def parse_clock(value: Any) -> float:
+    """Convert a time-like value to minutes since midnight."""
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, time):
+        return value.hour * 60 + value.minute + value.second / 60
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.hour * 60 + value.minute + value.second / 60
+    text = str(value).strip()
+    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"):
+        try:
+            parsed = datetime.strptime(text, fmt).time()
+            return parsed.hour * 60 + parsed.minute + parsed.second / 60
+        except ValueError:
+            continue
+    return np.nan
+
+
+def parse_date_column(frame: pd.DataFrame) -> pd.DataFrame:
+    """Parse dates day-first while retaining invalid/missing values as NaT."""
+    if "Date" in frame.columns:
+        frame["Date_original"] = frame["Date"].astype("string")
+        frame["Date"] = pd.to_datetime(frame["Date"], dayfirst=True, errors="coerce")
+    return frame
+
+
+def derive_block(hour: pd.Series) -> pd.Series:
+    """Assign the configured AM, MD and PM blocks from numeric hours."""
+    conditions = [
+        hour.lt(11),
+        hour.ge(11) & hour.lt(15),
+        hour.ge(15),
+    ]
+    return pd.Series(
+        np.select(conditions, ["AM", "MD", "PM"], default=None),
+        index=hour.index,
+        dtype="string",
+    )
+
+
+def normalize_frame(sheet_key: str, frame: pd.DataFrame) -> pd.DataFrame:
+    """Add normalized date, time, hour, block, route and source fields."""
+    frame = parse_date_column(frame)
+    event_time = SHEET_CONFIG[sheet_key]["event_time"]
+    time_columns = {
+        column
+        for column in (event_time, "Time joined", "Time boarded", "Arrived", "Departed")
+        if column and column in frame.columns
+    }
+    for column in time_columns:
+        frame[f"{column} minutes"] = frame[column].map(parse_clock).astype("float64")
+    if event_time and event_time in frame.columns:
+        minutes = frame[f"{event_time} minutes"]
+        frame["hour"] = minutes / 60.0
+        derived_block = derive_block(frame["hour"])
+        frame["Block"] = derived_block.fillna(
+            frame.get("Block", pd.Series(pd.NA, index=frame.index, dtype="string"))
+            .astype("string")
+            .str.upper()
+        )
+        frame["time_of_day"] = pd.to_datetime(
+            minutes, unit="m", origin="1899-12-30", errors="coerce"
+        ).dt.time
+    else:
+        frame["hour"] = np.nan
+        frame["time_of_day"] = pd.Series(
+            pd.NA, index=frame.index, dtype="object"
+        )
+    if "Day" in frame.columns:
+        frame["Day"] = frame["Day"].astype("string").str.strip().str.title()
+    if "Stop" in frame.columns and "Destination / direction" in frame.columns:
+        stop = frame["Stop"].astype("string").str.strip()
+        destination = frame["Destination / direction"].astype("string").str.strip()
+        frame["stop_direction"] = stop.fillna("Unknown stop") + " -> " + destination.fillna(
+            "Unknown destination"
+        )
+    if "Date" in frame.columns and "Day" in frame.columns:
+        parsed_day = frame["Date"].dt.day_name()
+        frame["date_day_mismatch"] = (
+            frame["Date"].notna()
+            & frame["Day"].notna()
+            & parsed_day.ne(frame["Day"])
+        )
+    else:
+        frame["date_day_mismatch"] = False
+    return frame
+
+
+def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Return a numeric column, or an all-missing series when absent."""
+    if column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype="float64")
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def prepare_wait_data(wait: pd.DataFrame) -> pd.DataFrame:
+    """Recompute waits from joined/boarded clocks and keep censoring explicit."""
+    frame = wait.copy()
+    joined = frame.get("Time joined", pd.Series(pd.NA, index=frame.index)).map(
+        parse_clock
+    )
+    boarded = frame.get("Time boarded", pd.Series(pd.NA, index=frame.index)).map(
+        parse_clock
+    )
+    frame["joined_minutes"] = pd.to_numeric(joined, errors="coerce")
+    frame["boarded_minutes"] = pd.to_numeric(boarded, errors="coerce")
+    frame["end_before_start"] = (
+        frame["boarded_minutes"].notna()
+        & frame["joined_minutes"].notna()
+        & frame["boarded_minutes"].lt(frame["joined_minutes"])
+    )
+    unfinished = pd.Series(False, index=frame.index)
+    if "Unfinished?" in frame.columns:
+        unfinished = (
+            frame["Unfinished?"]
+            .astype("string")
+            .str.strip()
+            .str.casefold()
+            .isin({"yes", "true", "1"})
+        )
+    frame["censored"] = frame["boarded_minutes"].isna() | unfinished
+    frame["wait_minutes"] = frame["boarded_minutes"] - frame["joined_minutes"]
+    invalid = frame["end_before_start"] | frame["joined_minutes"].isna()
+    frame.loc[frame["censored"] | invalid, "wait_minutes"] = np.nan
+    frame.loc[frame["wait_minutes"].lt(0), "wait_minutes"] = np.nan
+    frame["wait_event"] = frame["wait_minutes"].notna()
+    frame["censor_time_available"] = False
+    if "Type used" in frame.columns:
+        normalized_type = (
+            frame["Type used"].astype("string").str.strip().str.casefold()
+        )
+        frame["Type used"] = normalized_type.map(
+            {"cng bus": "CNG bus", "keke": "Keke"}
+        ).fillna(frame["Type used"])
+    return frame
+
+
+def wilson_interval(successes: int, total: int) -> tuple[float, float]:
+    """Compute a Wilson 95% confidence interval for a proportion."""
+    if total == 0:
+        return np.nan, np.nan
+    z = 1.959963984540054
+    proportion = successes / total
+    denominator = 1 + z**2 / total
+    center = (proportion + z**2 / (2 * total)) / denominator
+    margin = (
+        z
+        * math.sqrt(
+            proportion * (1 - proportion) / total + z**2 / (4 * total**2)
+        )
+        / denominator
+    )
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def vehicle_efficiency(
+    queue: pd.DataFrame, vehicle: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Compute headway, route load/left-behind, and demand-capacity metrics."""
+    vehicles = vehicle.copy()
+    vehicles["arrived_minutes"] = vehicles.get(
+        "Arrived minutes", pd.Series(np.nan, index=vehicles.index)
+    )
+    vehicles["capacity_numeric"] = _numeric(vehicles, "Capacity")
+    if "Type" in vehicles.columns:
+        type_capacity = (
+            vehicles["Type"].astype("string").str.strip().str.casefold().map(
+                {"cng bus": CAPACITIES["CNG bus"], "keke": CAPACITIES["Keke"]}
+            )
+        )
+        vehicles["capacity_numeric"] = vehicles["capacity_numeric"].fillna(
+            type_capacity
+        )
+    vehicles["boarded_numeric"] = _numeric(vehicles, "Boarded")
+    vehicles["left_behind_numeric"] = _numeric(vehicles, "Left behind")
+    vehicles["load_factor"] = (
+        vehicles["boarded_numeric"] / vehicles["capacity_numeric"]
+    )
+    vehicles["hour_slot"] = np.floor(vehicles["hour"])
+    vehicles["headway_min"] = vehicles.sort_values(
+        ["Date", "stop_direction", "arrived_minutes"]
+    ).groupby(["Date", "stop_direction"], dropna=False)["arrived_minutes"].diff()
+    vehicles.loc[vehicles["headway_min"].le(0), "headway_min"] = np.nan
+
+    headway = (
+        vehicles.groupby(["stop_direction", "hour_slot"], dropna=False)
+        .agg(
+            mean_headway_min=("headway_min", "mean"),
+            median_headway_min=("headway_min", "median"),
+            n=("headway_min", "count"),
+        )
+        .reset_index()
+    )
+    load = (
+        vehicles.groupby(["stop_direction", "Type"], dropna=False)
+        .agg(
+            mean_load_factor=("load_factor", "mean"),
+            boarded_total=("boarded_numeric", "sum"),
+            capacity_total=("capacity_numeric", "sum"),
+            left_behind_total=("left_behind_numeric", "sum"),
+            n=("Vehicle ID", "count"),
+        )
+        .reset_index()
+    )
+    load["left_behind_rate"] = load["left_behind_total"] / (
+        load["boarded_total"] + load["left_behind_total"]
+    )
+    load["load_factor_pct"] = load["mean_load_factor"] * 100
+
+    queue_hour = queue.copy()
+    queue_hour["hour_slot"] = np.floor(queue_hour["hour"])
+    queue_hour["arrivals_numeric"] = _numeric(queue_hour, "New arrivals (10 min)")
+    arrivals = (
+        queue_hour.groupby(["Date", "stop_direction", "hour_slot"], dropna=False)
+        .agg(arrivals_per_hour=("arrivals_numeric", "sum"))
+        .reset_index()
+        .groupby(["stop_direction", "hour_slot"], dropna=False)
+        .agg(
+            demand_per_hour=("arrivals_per_hour", "mean"),
+            demand_n=("arrivals_per_hour", "count"),
+        )
+        .reset_index()
+    )
+    departed_minutes = vehicles.get(
+        "Departed minutes", pd.Series(np.nan, index=vehicles.index)
+    )
+    vehicles["departed_hour_slot"] = np.floor(
+        pd.to_numeric(departed_minutes, errors="coerce") / 60
+    )
+    vehicles["departed_capacity"] = vehicles["capacity_numeric"].where(
+        pd.to_numeric(departed_minutes, errors="coerce").notna(), np.nan
+    )
+    capacity = (
+        vehicles.groupby(
+            ["Date", "stop_direction", "departed_hour_slot"], dropna=False
+        )
+        .agg(capacity_per_hour=("departed_capacity", "sum"))
+        .reset_index()
+        .rename(columns={"departed_hour_slot": "hour_slot"})
+        .groupby(["stop_direction", "hour_slot"], dropna=False)
+        .agg(
+            seats_leaving_per_hour=("capacity_per_hour", "mean"),
+            capacity_n=("capacity_per_hour", "count"),
+        )
+        .reset_index()
+    )
+    demand_capacity = arrivals.merge(
+        capacity, on=["stop_direction", "hour_slot"], how="outer"
+    )
+    demand_capacity["demand_to_capacity_ratio"] = (
+        demand_capacity["demand_per_hour"]
+        / demand_capacity["seats_leaving_per_hour"].replace(0, np.nan)
+    )
+    demand_capacity["n"] = demand_capacity[["demand_n", "capacity_n"]].max(axis=1)
+    return headway, load, demand_capacity
+
+
+
+
+
+def load_frames() -> dict[str, pd.DataFrame]:
+    """Load all observation sheets and add the derived fields the app uses."""
+    frames = load_all_data()
+    wait = prepare_wait_data(frames["wait"])
+    for key in ("queue", "vehicle"):
+        frames[key]["hour_slot"] = np.floor(frames[key]["hour"])
+    wait["hour_slot"] = np.floor(wait["hour"])
+    frames["wait"] = wait
+    frames["vehicle"]["Type"] = frames["vehicle"]["Type"].astype("string").str.strip()
+    for key in ("queue", "wait", "vehicle"):
+        f = frames[key]
+        f["Day"] = f["Day"].fillna(f["Date"].dt.day_name())
+        f["is_weekend"] = f["Day"].isin(["Saturday", "Sunday"])
+        for col in ("stop_direction", "Block", "Day", "Stop", "Type", "Type used"):
+            if col in f:
+                f[col] = f[col].astype(object).where(f[col].notna(), None)
+    # The 12 stop-directions on the observation rota (defined by the queue sheet);
+    # a handful of stray rows (missing or same-stop destinations) are excluded.
+    main_routes = set(frames["queue"]["stop_direction"].dropna()) - {
+        r for r in frames["queue"]["stop_direction"].dropna() if "Unknown" in r
+    }
+    for key in ("queue", "wait", "vehicle"):
+        frames[key]["valid_route"] = frames[key]["stop_direction"].isin(main_routes)
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Sheets the field team left empty, filled from data that WAS collected
+# ---------------------------------------------------------------------------
+MAIN_WEEK_START = pd.Timestamp("2026-10-26")
+
+
+def fleet_availability(vehicle: pd.DataFrame) -> pd.DataFrame:
+    """Sheet D rebuilt from sheet C: one row per vehicle per day of the main week.
+
+    A vehicle counts as 'Operating' on a day if it was logged arriving at any
+    observed stop that day. Vehicles in the week's fleet list that were never
+    logged that day are 'Not observed' (they may have been parked, faulty or
+    working routes we did not watch; the field sheet cannot tell which).
+    """
+    v = vehicle[vehicle["valid_route"] & vehicle["Date"].ge(MAIN_WEEK_START)].dropna(subset=["Vehicle ID"])
+    fleet = v.groupby("Vehicle ID")["Type"].agg(lambda s: s.mode().iat[0]).reset_index()
+    days = sorted(v["Date"].dropna().unique())
+    grid = fleet.merge(pd.DataFrame({"Date": days}), how="cross")
+    seen = (v.groupby(["Date", "Vehicle ID"])
+            .agg(arrivals=("Arrived", "size"),
+                 first_seen=("Arrived minutes", "min"), last_seen=("Arrived minutes", "max"),
+                 stops=("Stop", lambda s: ", ".join(sorted(s.dropna().unique()))))
+            .reset_index())
+    out = grid.merge(seen, on=["Date", "Vehicle ID"], how="left")
+    out["Status"] = np.where(out["arrivals"].notna(), "Operating", "Not observed")
+    out["arrivals"] = out["arrivals"].fillna(0).astype(int)
+    fmt = lambda m: f"{int(m // 60):02d}:{int(m % 60):02d}" if pd.notna(m) else ""
+    out["first_seen"] = out["first_seen"].map(fmt)
+    out["last_seen"] = out["last_seen"].map(fmt)
+    out["Day"] = pd.to_datetime(out["Date"]).dt.day_name()
+    out = out.rename(columns={"arrivals": "Arrivals logged", "first_seen": "First seen",
+                              "last_seen": "Last seen", "stops": "Stops served"})
+    out["Source"] = "Derived from sheet C (vehicle & trip log)"
+    return out[["Date", "Day", "Vehicle ID", "Type", "Status", "Arrivals logged",
+                "First seen", "Last seen", "Stops served", "Source"]].sort_values(["Date", "Type", "Vehicle ID"])
+
+
+def holdout_validation(wait: pd.DataFrame) -> pd.DataFrame:
+    """Leave-one-day-out test of a simple wait predictor.
+
+    For each day of the main week, the model is built from the OTHER six days:
+    predicted wait = median wait for the same stop-direction, time block and
+    vehicle type; the 80% range = 10th–90th percentile; the chance of boarding
+    within 10 minutes = share of those training passengers who did. It is then
+    scored against every passenger actually timed on the held-out day. The
+    baseline predicts the overall median wait for everyone.
+    """
+    w = wait[wait["valid_route"] & wait["wait_event"] & wait["Date"].ge(MAIN_WEEK_START)].copy()
+    key = ["stop_direction", "Block", "Type used"]
+    rows = []
+    for day in sorted(w["Date"].unique()):
+        train, test = w[w["Date"] != day], w[w["Date"] == day]
+        g = (train.groupby(key)["wait_minutes"]
+             .agg(pred="median", lo=lambda s: s.quantile(.1), hi=lambda s: s.quantile(.9),
+                  p10=lambda s: s.le(10).mean(), n_train="count").reset_index())
+        t = test.merge(g, on=key, how="inner")
+        t["baseline"] = train["wait_minutes"].median()
+        rows.append(t)
+    t = pd.concat(rows, ignore_index=True)
+    t["abs_error"] = (t["wait_minutes"] - t["pred"]).abs()
+    t["baseline_abs_error"] = (t["wait_minutes"] - t["baseline"]).abs()
+    t["within_80"] = t["wait_minutes"].between(t["lo"], t["hi"])
+    t["boarded_10"] = t["wait_minutes"].le(10)
+    return t
+
+
+def validation_sheet(t: pd.DataFrame) -> pd.DataFrame:
+    """Hold-out results laid out like the team's Validation template."""
+    clock = lambda m: f"{int(m // 60):02d}:{int(m % 60):02d}" if pd.notna(m) else ""
+    return pd.DataFrame({
+        "Date": t["Date"].dt.strftime("%d/%m/%Y"), "Day": t["Day"], "Block": t["Block"], "Stop": t["Stop"],
+        "Observer pair": t["Roster pair (reference)"], "Destination / direction": t["Destination / direction"],
+        "Type used": t["Type used"], "Time joined": t["joined_minutes"].map(clock),
+        "Predicted wait (min)": t["pred"].round(1), "80% low (min)": t["lo"].round(1), "80% high (min)": t["hi"].round(1),
+        "Predicted chance of boarding within 10 min": t["p10"].round(3),
+        "Time boarded": t["boarded_minutes"].map(clock), "Observed wait (min)": t["wait_minutes"],
+        "Within 80% range?": np.where(t["within_80"], "Yes", "No"), "Absolute error (min)": t["abs_error"].round(1),
+        "Boarded within 10 min?": np.where(t["boarded_10"], "Yes", "No"),
+        "Method": "Leave-one-day-out: model built from the other 6 days of the main week",
+    })
+
+
+# ==========================================================================
+# SURVIVAL ANALYSIS AND QUEUE SIMULATION (formerly cng_sim.py)
+# ==========================================================================
+
+import numpy as np
+import pandas as pd
+
+END_OF_DAY = 18 * 60.0
+PCTS = (50, 75, 90, 95)
+
+
+# ---------------------------------------------------------------------------
+# Survival analysis (Kaplan–Meier) with unfinished waits censored at 18:00
+# ---------------------------------------------------------------------------
+def survival_input(wait: pd.DataFrame) -> pd.DataFrame:
+    """Durations and event flags: completed waits are events; unfinished ones are
+    censored at the end of observation (18:00) — their wait was at least that long."""
+    w = wait.copy()
+    dur = w["wait_minutes"].copy()
+    cens = w["censored"] & w["joined_minutes"].notna()
+    dur[cens] = (END_OF_DAY - w.loc[cens, "joined_minutes"]).clip(lower=0)
+    w["duration"] = dur
+    w["event"] = ~w["censored"]
+    return w.dropna(subset=["duration"])
+
+
+def kaplan_meier(duration: pd.Series, event: pd.Series) -> pd.DataFrame:
+    """Return the share still waiting S(t) at each minute t."""
+    d = pd.DataFrame({"t": np.round(duration.values.astype(float)), "e": event.values.astype(bool)})
+    times = np.arange(0, int(np.ceil(d["t"].max())) + 1)
+    n_at_risk = len(d)
+    s = 1.0
+    out = []
+    grouped = d.groupby("t")
+    events = grouped["e"].sum()
+    totals = grouped.size()
+    for t in times:
+        out.append((t, s))  # S just before leaving time t is S(t-)
+        if t in totals.index:
+            e = events.get(t, 0)
+            if n_at_risk > 0:
+                s *= 1 - e / n_at_risk
+            n_at_risk -= totals[t]
+    surv = pd.DataFrame(out, columns=["t", "still_waiting"])
+    # S(t) after events at t
+    surv["still_waiting"] = surv["still_waiting"].shift(-1).fillna(s)
+    return surv
+
+
+def km_percentile(surv: pd.DataFrame, p: float) -> float:
+    """Smallest t with S(t) <= 1 - p/100 (the p-th percentile wait)."""
+    hit = surv.loc[surv["still_waiting"] <= 1 - p / 100, "t"]
+    return float(hit.iloc[0]) if len(hit) else np.nan
+
+
+def area_under_curve(surv: pd.DataFrame) -> float:
+    """Area under S(t) = (restricted) mean wait in minutes."""
+    return float(surv["still_waiting"].sum())
+
+
+def percentile_table(wait: pd.DataFrame, by: list[str] | None = None) -> pd.DataFrame:
+    """P50/P75/P90/P95 and area under the curve, KM-adjusted for unfinished waits."""
+    w = survival_input(wait)
+    groups = [((), w)] if not by else w.groupby(by)
+    rows = []
+    for key, g in groups:
+        surv = kaplan_meier(g["duration"], g["event"])
+        row = dict(zip(by or [], key if isinstance(key, tuple) else (key,)))
+        row.update({f"P{p}": km_percentile(surv, p) for p in PCTS})
+        row["area"] = area_under_curve(surv)
+        row["n"] = len(g)
+        row["unfinished"] = int((~g["event"]).sum())
+        row["over15"] = float(surv.loc[surv["t"] == 15, "still_waiting"].iat[0]) if (surv["t"] == 15).any() else 0.0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def tail_share(waits: pd.Series, p: float = 90) -> float:
+    """Share of all passenger-minutes spent by the passengers above the p-th percentile."""
+    w = waits.dropna()
+    cut = np.percentile(w, p)
+    return float(w[w > cut].sum() / w.sum()) if w.sum() else np.nan
+
+
+# ---------------------------------------------------------------------------
+# Simulation
+# ---------------------------------------------------------------------------
+def _arrivals(qd: pd.DataFrame) -> np.ndarray:
+    """Passenger arrival times (minutes) for one route-day from sheet B1.
+
+    Each count is "new arrivals in the last 10 minutes". When two counts were taken
+    less than 10 minutes apart the windows overlap, so only the new part of the
+    window (gap / 10 of the count) is added, to avoid counting people twice."""
+    qd = qd.dropna(subset=["Time minutes"]).sort_values("Time minutes")
+    times: list[float] = []
+    prev = None
+    for t, new, queue in zip(qd["Time minutes"], qd["New arrivals (10 min)"], qd["Queue size"]):
+        if prev is None:  # people already queuing when observation began
+            times += [t] * int(max(queue, 0))
+            prev = t
+            continue
+        gap = t - prev
+        if gap <= 0:
+            continue
+        span = min(gap, 10.0)
+        n = int(round(max(new, 0) * span / 10.0))
+        if n:
+            times += list(t - span + (np.arange(n) + 0.5) * span / n)
+        prev = t
+    return np.sort(np.array(times, dtype=float))
+
+
+def _vehicles(vd: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    vd = vd.dropna(subset=["Arrived minutes"]).sort_values("Arrived minutes")
+    cap = pd.to_numeric(vd["Spaces free on arrival"], errors="coerce")
+    full_cap = pd.to_numeric(vd["Capacity"], errors="coerce").fillna(vd["Type"].map({"CNG bus": 13, "Keke": 5}))
+    cap = cap.fillna(full_cap)
+    arr = vd["Arrived minutes"].to_numpy(float)
+    dep = pd.to_numeric(vd["Departed minutes"], errors="coerce").to_numpy(float)
+    dep = np.where(np.isnan(dep) | (dep < arr), arr, dep)
+    return arr, dep, cap.to_numpy(float), vd["Type"].astype(str).to_numpy()
+
+
+def serve(arr: np.ndarray, veh_t: np.ndarray, veh_cap: np.ndarray, veh_dep: np.ndarray | None = None) -> np.ndarray:
+    """FIFO boarding. A vehicle loads everyone already queuing when it arrives and
+    anyone who walks up while it is still at the stop (until it departs), up to its
+    free seats. Returns each passenger's wait (NaN = still waiting at 18:00)."""
+    if veh_dep is None:
+        veh_dep = veh_t
+    order = np.argsort(veh_t)
+    veh_t, veh_cap, veh_dep = veh_t[order], veh_cap[order], veh_dep[order]
+    waits = np.full(len(arr), np.nan)
+    head = 0
+    for t, c, d in zip(veh_t, veh_cap, veh_dep):
+        avail_end = np.searchsorted(arr, max(d, t), side="right")
+        take = int(min(c, max(avail_end - head, 0)))
+        if take:
+            waits[head:head + take] = np.maximum(t - arr[head:head + take], 0)
+            head += take
+    return waits
+
+
+def simulate(queue: pd.DataFrame, vehicle: pd.DataFrame, modify=None) -> pd.DataFrame:
+    """Simulate every route-day. `modify(route, date, veh_t, veh_cap, veh_type)` may
+    return altered (veh_t, veh_cap) to test a scenario."""
+    out = []
+    vgroups = {k: g for k, g in vehicle.groupby(["Date", "stop_direction"])}
+    for (date, route), qd in queue.groupby(["Date", "stop_direction"]):
+        arr = _arrivals(qd)
+        if not len(arr):
+            continue
+        vd = vgroups.get((date, route))
+        if vd is None:
+            vt, vdep, vc, vty = (np.array([]),) * 4
+        else:
+            vt, vdep, vc, vty = _vehicles(vd)
+        dwell = np.median(vdep - vt) if len(vt) else 0.0
+        if modify is not None:
+            n0 = len(vt)
+            keep_dwell = dict(zip(vt, vdep - vt))
+            vt, vc = modify(route, date, vt, vc, vty)
+            # moved vehicles keep their dwell time; added ones get the route's median dwell
+            vdep = np.array([t + keep_dwell.get(t, dwell) for t in vt])
+        wt = serve(arr, vt, vc, vdep)
+        out.append(pd.DataFrame({"Date": date, "stop_direction": route, "joined_minutes": arr, "sim_wait": wt}))
+    sim = pd.concat(out, ignore_index=True)
+    sim["hour_slot"] = np.floor(sim["joined_minutes"] / 60)
+    sim["Block"] = np.select([sim["hour_slot"] < 11, sim["hour_slot"] < 15], ["AM", "MD"], "PM")
+    sim["censored"] = sim["sim_wait"].isna()
+    sim["wait_minutes"] = sim["sim_wait"]
+    sim["wait_event"] = ~sim["censored"]
+    return sim
+
+
+def summarize_sim(sim: pd.DataFrame, by: list[str] | None = None) -> pd.DataFrame:
+    return percentile_table(sim, by)
+
+
+# ---------------------------------------------------------------------------
+# Scenarios
+# ---------------------------------------------------------------------------
+def scenario_even_spacing(route, date, vt, vc, vty):
+    """Same vehicles each hour, but arriving at evenly spaced times (no bunching)."""
+    if not len(vt):
+        return vt, vc
+    hours = np.floor(vt / 60)
+    new_t = vt.copy()
+    for h in np.unique(hours):
+        m = hours == h
+        k = m.sum()
+        new_t[m] = h * 60 + (np.arange(k) + 0.5) * 60 / k
+    return new_t, vc
+
+
+def scenario_add_peak(routes_hours: set[tuple[str, int]], extra_per_hour: int = 2, seats: int = 13):
+    """Add `extra_per_hour` CNG buses, evenly spaced, in the given (route, hour) cells."""
+    def modify(route, date, vt, vc, vty):
+        add_t = [h * 60 + (i + 0.5) * 60 / extra_per_hour
+                 for (r, h) in routes_hours if r == route for i in range(extra_per_hour)]
+        if not add_t:
+            return vt, vc
+        return np.concatenate([vt, add_t]), np.concatenate([vc, [seats] * len(add_t)])
+    return modify
+
+
+def scenario_reallocate(targets: set[tuple[str, int]], donors: list[str], per_hour: int = 2):
+    """Take `per_hour` CNG buses from donor routes in the same hour and run them on target cells."""
+    def modify(route, date, vt, vc, vty):
+        hours = np.floor(vt / 60) if len(vt) else np.array([])
+        if route in donors:
+            target_hours = {h for (_, h) in targets}
+            keep = np.ones(len(vt), bool)
+            for h in target_hours:
+                idx = np.where((hours == h) & (vty == "CNG bus"))[0]
+                # each target cell needs per_hour buses; spread the donation over donors
+                n_take = int(np.ceil(per_hour * sum(1 for (_, hh) in targets if hh == h) / len(donors)))
+                keep[idx[:n_take]] = False
+            return vt[keep], vc[keep]
+        add_t = [h * 60 + (i + 0.5) * 60 / per_hour for (r, h) in targets if r == route for i in range(per_hour)]
+        if add_t:
+            return np.concatenate([vt, add_t]), np.concatenate([vc, [13] * len(add_t)])
+        return vt, vc
+    return modify
+
+
+def compose(*mods):
+    """Apply several scenario modifiers in turn."""
+    def modify(route, date, vt, vc, vty):
+        types = vty
+        for m in mods:
+            n_before = len(vt)
+            vt, vc = m(route, date, vt, vc, types)
+            if len(vt) != n_before:  # vehicles were added/removed: treat added ones as buses
+                types = np.array(list(types[:min(len(types), len(vt))]) + ["CNG bus"] * max(0, len(vt) - len(types)))
+        return vt, vc
+    return modify
+
+
+HOT_CELLS = (
+    {("NEW MARKET -> ACADEMICS", h) for h in (8, 9, 10)}
+    | {("CAMPUS GATE -> BUS STOP", h) for h in (8, 9, 10)}
+    | {("BUS STOP -> CAMPUS GATE", h) for h in (15, 16, 17)}
+)
+DONORS = ["CAMPUS GATE -> HALL", "HALL -> CAMPUS GATE"]
+
+
+def scenario_table(queue: pd.DataFrame, vehicle: pd.DataFrame, extra: int = 2) -> tuple[pd.DataFrame, dict]:
+    """Run the standard set of what-if scenarios. Returns a summary table and the simulations."""
+    days = queue["Date"].nunique()
+    runs = {
+        "As observed": None,
+        "Even spacing (same vehicles)": scenario_even_spacing,
+        f"Move {extra} buses/hour from Hall ↔ Campus Gate to the 9 peak route-hours": scenario_reallocate(HOT_CELLS, DONORS, extra),
+        f"Add {extra} buses/hour in the 9 peak route-hours": scenario_add_peak(HOT_CELLS, extra),
+        f"Move {extra} buses/hour + even spacing": compose(scenario_reallocate(HOT_CELLS, DONORS, extra), scenario_even_spacing),
+    }
+    sims, rows = {}, []
+    for label, mod in runs.items():
+        sim = simulate(queue, vehicle, mod)
+        sims[label] = sim
+        o = percentile_table(sim).iloc[0]
+        c = sim[sim["wait_event"]]
+        donor = percentile_table(sim[sim["stop_direction"].isin(DONORS)]).iloc[0]
+        hot = sim.set_index(["stop_direction", "hour_slot"]).index.isin(list(HOT_CELLS))
+        hot_t = percentile_table(sim[hot]).iloc[0]
+        rows.append({"scenario": label, "P50": o["P50"], "P75": o["P75"], "P90": o["P90"], "P95": o["P95"],
+                     "area": o["area"], "over15": o["over15"],
+                     "hours_per_day": c["wait_minutes"].sum() / 60 / days,
+                     "peak_P90": hot_t["P90"], "donor_P90": donor["P90"], "donor_area": donor["area"]})
+    t = pd.DataFrame(rows)
+    base = t.iloc[0]
+    t["area_change"] = t["area"] / base["area"] - 1
+    t["hours_saved_per_day"] = base["hours_per_day"] - t["hours_per_day"]
+    return t, sims
+
+
+# Short names used below: D.<data helper>, S.<simulation helper>
+D = S = types.SimpleNamespace(**{k: v for k, v in globals().items() if not k.startswith('__')})
 
 HERE = Path(__file__).resolve().parent
 
